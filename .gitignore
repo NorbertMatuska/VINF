@@ -1,0 +1,9 @@
+.idea/
+.venv/
+csv_data/
+extracted_metadata/
+rotten_tomatoes_data/
+rt_roots_html/
+half_working_index
+search_index.json
+tmp.py
