@@ -2,7 +2,9 @@
 # rt_lucene_parquet_search.py
 #
 # Lucene-based index + CLI search for RottenTomatoes + Wikipedia joined data.
-# Source: Spark output rt_wiki_join.parquet (exact+fuzzy RT/Wiki join).
+# Source:
+#   - Spark output rt_wiki_join.parquet (RT+Wiki join)
+#   - Spark output rt.parquet (RT-only filmy/seriály, ktoré sa nepodarilo joinuť)
 
 import os
 import time
@@ -35,20 +37,22 @@ from org.apache.lucene.search import (
     BooleanClause,
     TermQuery,
     TopDocs,
-    FuzzyQuery,
     BoostQuery,
 )
 
-from org.apache.lucene.queryparser.classic import MultiFieldQueryParser
 from org.apache.lucene.queryparser.classic import QueryParser
-
 
 # ============================================================
 #  CONFIG / ENV
 # ============================================================
 
 # Path to Spark join parquet (directory OR single part-*.parquet file)
-DEFAULT_PARQUET_PATH = os.environ.get("RT_WIKI_JOIN_PATH", "/data/rt_wiki_join.parquet")
+DEFAULT_JOIN_PARQUET_PATH = os.environ.get("RT_WIKI_JOIN_PATH", "/data/rt_wiki_join.parquet")
+# Path to Spark RT-only parquet
+DEFAULT_RT_PARQUET_PATH = os.environ.get("RT_PARQUET_PATH", "/data/rt.parquet")
+
+# Backwards-compatible alias (used by CLI constructor)
+DEFAULT_PARQUET_PATH = DEFAULT_JOIN_PARQUET_PATH
 
 # Directory where Lucene index lives
 DEFAULT_INDEX_DIR = os.environ.get("RT_INDEX_DIR", "/data/rt_lucene_index")
@@ -60,7 +64,7 @@ DEFAULT_INDEX_DIR = os.environ.get("RT_INDEX_DIR", "/data/rt_lucene_index")
 
 class LuceneRTIndex:
     """
-    Lucene-backed index for RT+Wiki joined records.
+    Lucene-backed index for RT+Wiki joined records + RT-only records.
 
     We index:
       - Text fields:
@@ -277,13 +281,12 @@ class LuceneRTIndex:
     def _build_text_query(self, query_str: str):
         """
         Multi-field query: OR inside each field, OR across fields, with boosts.
-        This mimics your old "bag-of-words over everything" behaviour while
-        still letting BM25 do ranking.
+        Similar na pôvodné „bag-of-words všade“, ale scoring robí Lucene BM25.
         """
         fields = ["title", "synopsis", "genres_text", "director", "cast", "wiki_title"]
         boosts = {
-            "title": 3.0,
-            "synopsis": 2.0,
+            "title": 1.5,
+            "synopsis": 1.2,
             "genres_text": 1.5,
             "director": 1.2,
             "cast": 1.5,
@@ -296,7 +299,6 @@ class LuceneRTIndex:
             parser = QueryParser(field, self.analyzer)
             parser.setDefaultOperator(QueryParser.Operator.OR)
 
-            # You can escape special chars if you want to be extra safe
             q = parser.parse(query_str)
 
             boost = boosts.get(field, 1.0)
@@ -367,11 +369,11 @@ class LuceneRTIndex:
 
             # Stored numeric stuff
             for fld in (
-                    "release_year",
-                    "tomatometer",
-                    "audience_score",
-                    "runtime_minutes",
-                    "join_confidence",
+                "release_year",
+                "tomatometer",
+                "audience_score",
+                "runtime_minutes",
+                "join_confidence",
             ):
                 val = doc.get(fld)
                 if val is not None:
@@ -383,7 +385,6 @@ class LuceneRTIndex:
             except Exception:
                 genres_vals = []
             if genres_vals:
-                # convert Java array -> Python list
                 res["genres"] = list(genres_vals)
 
             try:
@@ -397,33 +398,20 @@ class LuceneRTIndex:
 
         return results
 
-    def fuzzy_title_search(self, title: str, max_edits: int = 2, top_k: int = 10) -> List[Dict[str, Any]]:
-        if self.searcher is None:
-            self.open_searcher()
-
-        # StandardAnalyzer lowercases tokens, so we do the same
-        term = Term("title", title.lower())
-        fq = FuzzyQuery(term, max_edits)
-        top_docs = self.searcher.search(fq, top_k)
-        out: List[Dict[str, Any]] = []
-        for sd in top_docs.scoreDocs:
-            doc = self.searcher.doc(sd.doc)
-            out.append({
-                "title": doc.get("title"),
-                "page_type": doc.get("page_type"),
-                "url": doc.get("url"),
-                "score": float(sd.score),
-            })
-        return out
-
 
 # ============================================================
-#  Search engine: build index from rt_wiki_join.parquet
+#  Search engine: build index from rt_wiki_join.parquet + rt.parquet
 # ============================================================
 
 class LuceneRTSearchEngine:
-    def __init__(self, parquet_path: str = DEFAULT_PARQUET_PATH, index_dir: str = DEFAULT_INDEX_DIR):
-        self.parquet_path = parquet_path
+    def __init__(
+        self,
+        parquet_path: str = DEFAULT_PARQUET_PATH,  # join parquet
+        index_dir: str = DEFAULT_INDEX_DIR,
+        rt_parquet_path: str = DEFAULT_RT_PARQUET_PATH,
+    ):
+        self.parquet_path = parquet_path          # joined RT+Wiki
+        self.rt_parquet_path = rt_parquet_path    # RT-only
         self.index = LuceneRTIndex(index_dir=index_dir)
         self.loaded = False
 
@@ -433,27 +421,33 @@ class LuceneRTSearchEngine:
         self,
         max_docs: Optional[int] = None,
         min_join_conf: int = 1,
+        include_unjoined_rt: bool = True,
     ) -> bool:
-        path = self.parquet_path
-        if not os.path.exists(path):
-            print(f"Error: parquet path '{path}' does not exist in container.")
+        join_path = self.parquet_path
+        rt_path = self.rt_parquet_path
+
+        if not os.path.exists(join_path):
+            print(f"Error: join parquet path '{join_path}' does not exist in container.")
             return False
 
-        print(f"Reading rt_wiki_join parquet from: {path}")
-        table = pq.read_table(path)
-        rows = table.to_pylist()
-        total_rows = len(rows)
-        print(f"Loaded {total_rows} joined rows from parquet.")
+        print(f"Reading joined RT+Wiki parquet from: {join_path}")
+        join_table = pq.read_table(join_path)
+        join_rows = join_table.to_pylist()
+        total_join_rows = len(join_rows)
+        print(f"Loaded {total_join_rows} joined rows from parquet.")
 
         self.index.open_writer(recreate=True)
 
         count = 0
-        for row in rows:
-            # Spark join schema columns; we normalize them into 'meta'
+        joined_file_paths = set()
+
+        # ---- 1) Index joined RT+Wiki rows ----
+        for row in join_rows:
             join_conf = row.get("join_confidence")
+
+            # naozaj filtrujeme podľa min_join_conf (pôvodne tam mal iba 'pass')
             if join_conf is not None and join_conf < min_join_conf:
-                # 1 or 2 in your join; you can choose to only index 2 if you want.
-                pass
+                continue
 
             meta: Dict[str, Any] = {
                 # RT side
@@ -495,16 +489,75 @@ class LuceneRTSearchEngine:
             try:
                 self.index.add_document(meta)
                 count += 1
+                fp = meta.get("file_path") or row.get("file_path")
+                if fp:
+                    joined_file_paths.add(fp)
                 if max_docs is not None and count >= max_docs:
                     break
                 if count % 5000 == 0:
-                    print(f"  indexed {count} docs...")
+                    print(f"  indexed {count} docs (joined)...")
             except Exception as e:
-                print(f"Error indexing row with file_path={meta.get('file_path')}: {e}")
+                print(f"Error indexing joined row with file_path={meta.get('file_path')}: {e}")
+
+        joined_count = count
+
+        # ---- 2) Index RT-only rows (nejoinnuté), bez duplikátov podľa file_path ----
+        rt_only_count = 0
+        if include_unjoined_rt and (max_docs is None or count < max_docs):
+            if not os.path.exists(rt_path):
+                print(f"Warning: RT parquet path '{rt_path}' does not exist, skipping RT-only docs.")
+            else:
+                print(f"Reading RT parquet from: {rt_path}")
+                rt_table = pq.read_table(rt_path)
+                rt_rows = rt_table.to_pylist()
+                total_rt_rows = len(rt_rows)
+                print(f"Loaded {total_rt_rows} RT rows from parquet.")
+
+                for row in rt_rows:
+                    if max_docs is not None and count >= max_docs:
+                        break
+
+                    fp = row.get("file_path")
+                    if not fp:
+                        continue
+                    if fp in joined_file_paths:
+                        # tento RT dokument už máme v join časti
+                        continue
+
+                    meta_rt: Dict[str, Any] = {
+                        "file_path": fp,
+                        "page_type": row.get("page_type"),
+                        "url": row.get("url"),
+                        "title": row.get("title"),
+                        "title_norm": row.get("title_norm"),
+                        "description": row.get("description"),
+                        "synopsis": row.get("synopsis"),
+                        "genres": row.get("genres"),
+                        "director": row.get("director"),
+                        "cast": row.get("cast"),
+                        "rating": row.get("rating"),
+                        "rt_year": row.get("rt_year"),
+                        "tomatometer": row.get("tomatometer"),
+                        "audience_score": row.get("audience_score"),
+                        # žiadne wiki_* polia, join_confidence None
+                    }
+
+                    try:
+                        self.index.add_document(meta_rt)
+                        count += 1
+                        rt_only_count += 1
+                        if count % 5000 == 0:
+                            print(f"  indexed {count} docs (joined + RT-only)...")
+                    except Exception as e:
+                        print(f"Error indexing RT-only row with file_path={fp}: {e}")
 
         self.index.close_writer()
         self.loaded = True
-        print(f"Lucene indexing complete. Indexed {count} documents (from {total_rows} rows).")
+
+        print("\nLucene indexing complete.")
+        print(f"  Joined docs indexed : {joined_count}")
+        print(f"  RT-only docs indexed: {rt_only_count}")
+        print(f"  TOTAL docs indexed  : {count}")
         return True
 
     # ---------- search wrappers ----------
@@ -538,10 +591,6 @@ class LuceneRTSearchEngine:
             min_join_conf=min_join_conf,
         )
 
-    def fuzzy_title_search(self, query: str, max_edits: int = 2, top_k: int = 10) -> List[Dict[str, Any]]:
-        self._ensure_loaded()
-        return self.index.fuzzy_title_search(query, max_edits=max_edits, top_k=top_k)
-
 
 # ============================================================
 #  CLI
@@ -563,15 +612,14 @@ class SearchCLI:
         print("\n" + "=" * 70)
         print("       RT + WIKI LUCENE SEARCH (BM25, PyLucene, Parquet)")
         print("=" * 70)
-        print(f"Parquet : {self.parquet_path}")
-        print(f"Index   : {self.index_dir}")
+        print(f"Join parquet : {self.parquet_path}")
+        print(f"Index        : {self.index_dir}")
 
     def print_menu(self):
         print("\nMAIN MENU:")
-        print("1. Build Lucene index from rt_wiki_join.parquet")
+        print("1. Build Lucene index from parquet")
         print("2. Open existing Lucene index (no rebuild)")
         print("3. Search (multi-field BM25 + filters)")
-        print("4. Fuzzy title search (typo-tolerant)")
         print("0. Exit")
         print("-" * 70)
 
@@ -673,38 +721,6 @@ class SearchCLI:
 
         self.wait_for_enter()
 
-    def do_fuzzy_search(self):
-        if not self.setup_complete:
-            print("Index not set up yet. Use option 1 or 2 first.")
-            self.wait_for_enter()
-            return
-
-        self.clear_screen()
-        self.print_header()
-
-        print("\nFUZZY TITLE SEARCH")
-        query = input("Enter (possibly misspelled) title: ").strip()
-        if not query:
-            print("No query entered!")
-            self.wait_for_enter()
-            return
-
-        edits_raw = input("Max Levenshtein edits [1-2, default 2]: ").strip()
-        try:
-            max_edits = int(edits_raw) if edits_raw else 2
-        except Exception:
-            max_edits = 2
-
-        try:
-            start_time = time.time()
-            results = self.engine.fuzzy_title_search(query, max_edits=max_edits, top_k=10)
-            query_time = time.time() - start_time
-            self.display_results(results, query, f"Fuzzy title (edits={max_edits})", query_time)
-        except Exception as e:
-            print(f"Fuzzy search error: {e}")
-
-        self.wait_for_enter()
-
     # ---- display ----
 
     def display_results(self, results: List[Dict[str, Any]], query: str, method: str, query_time: float):
@@ -756,7 +772,6 @@ class SearchCLI:
 
             cast = res.get("cast")
             if cast:
-                # limit for readability, but still useful
                 cast_preview = cast[:6]
                 more = len(cast) - len(cast_preview)
                 if more > 0:
@@ -775,7 +790,7 @@ class SearchCLI:
             print(f"\nIndex status: {'READY' if self.setup_complete else 'NOT LOADED'}")
             self.print_menu()
 
-            choice = input("Enter your choice (0-4): ").strip()
+            choice = input("Enter your choice (0-3): ").strip()
 
             if choice == "0":
                 print("\nExiting ...")
@@ -786,8 +801,6 @@ class SearchCLI:
                 self.setup_engine()
             elif choice == "3":
                 self.do_search()
-            elif choice == "4":
-                self.do_fuzzy_search()
             else:
                 print("Invalid choice! Try again.")
                 self.wait_for_enter()
